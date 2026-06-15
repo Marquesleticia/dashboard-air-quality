@@ -124,7 +124,7 @@ def carregar_dataset():
 @st.cache_data(show_spinner=False)
 def carregar_modelo():
     import os
-    caminhos = ["data/isolation_forest_model.pkl"]
+    caminhos = ["models/isolation_forest_model.pkl"]
     for c in caminhos:
         if os.path.exists(c):
             with open(c, "rb") as f:
