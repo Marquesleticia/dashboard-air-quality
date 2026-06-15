@@ -84,21 +84,26 @@ st.markdown("""
 
 
 
+# Colunas que o dashboard realmente usa
+COLUNAS_UTEIS = ["Date", "Time", "CO(GT)", "C6H6(GT)", "NOx(GT)", "NO2(GT)", "T", "RH", "AH"]
+
 @st.cache_data(show_spinner=False)
 def carregar_dataset():
     """Baixa e prepara o dataset Air Quality UCI."""
+    import gc
     url = "https://archive.ics.uci.edu/ml/machine-learning-databases/00360/AirQualityUCI.zip"
+    df = None
     try:
         import io, zipfile, requests
         resp = requests.get(url, timeout=30)
         z = zipfile.ZipFile(io.BytesIO(resp.content))
         fname = [n for n in z.namelist() if n.endswith(".xlsx")][0]
         df = pd.read_excel(z.open(fname))
+        resp = None  # libera bytes do ZIP da memória
+        gc.collect()
     except Exception:
-      
         import os
         locais = ["data/AirQualityUCI.xlsx", "data/AirQualityUCI.csv"]
-        df = None
         for loc in locais:
             if os.path.exists(loc):
                 df = pd.read_excel(loc) if loc.endswith(".xlsx") else pd.read_csv(loc, sep=";")
@@ -107,17 +112,32 @@ def carregar_dataset():
             st.error("❌ Não foi possível carregar o dataset.")
             st.stop()
 
-  
-    df = df.dropna(how="all").drop(columns=[c for c in df.columns if c.startswith("Unnamed")])
+    # Descarta colunas desnecessárias (PT08.Sx, NMHC, etc.) o mais cedo possível
+    colunas_presentes = [c for c in COLUNAS_UTEIS if c in df.columns]
+    df = df[colunas_presentes].copy()
+
+    df = df.dropna(how="all").drop(columns=[c for c in df.columns if c.startswith("Unnamed")], errors="ignore")
     date_str = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce").dt.strftime("%d/%m/%Y")
     time_str = df["Time"].astype(str).str.replace(".", ":", regex=False)
     df["datetime"] = pd.to_datetime(date_str + " " + time_str, format="%d/%m/%Y %H:%M:%S", errors="coerce")
+
+    # Descarta Date e Time originais após criar datetime
+    df = df.drop(columns=["Date", "Time"], errors="ignore")
+
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
     df[numeric_cols] = df[numeric_cols].replace(-200, np.nan)
-    df["hour"]      = df["datetime"].dt.hour
-    df["dayofweek"] = df["datetime"].dt.dayofweek
-    df["month"]     = df["datetime"].dt.month
+
+    # Usa categorias para colunas de texto — economiza memória
+    df["hour"]      = df["datetime"].dt.hour.astype("int8")
+    df["dayofweek"] = df["datetime"].dt.dayofweek.astype("int8")
+    df["month"]     = df["datetime"].dt.month.astype("int8")
     df = df.dropna(subset=["datetime"])
+
+    # Converte floats para float32 (metade da memória)
+    for col in df.select_dtypes(include="float64").columns:
+        df[col] = df[col].astype("float32")
+
+    gc.collect()
     return df
 
 
@@ -134,6 +154,7 @@ def carregar_modelo():
 
 @st.cache_data(show_spinner=False)
 def detectar_anomalias(_artefato, _df):
+    import gc
     preprocessor = _artefato["preprocessor"]
     model        = _artefato["model"]
     pca_model    = _artefato["pca"]
@@ -144,18 +165,31 @@ def detectar_anomalias(_artefato, _df):
     X = preprocessor.transform(df_work[cols_presentes])
 
     pred = model.predict(X)
-    df_work["anomalia"]         = np.where(pred == -1, 1, 0)
-    df_work["classe"]           = np.where(pred == -1, "Anômalo", "Normal")
-    df_work["score_normalidade"]= model.decision_function(X)
-    df_work["score_anomalia"]   = -model.decision_function(X)
+    scores = model.decision_function(X)
+
+    df_work["anomalia"]          = np.where(pred == -1, 1, 0).astype("int8")
+    df_work["classe"]            = np.where(pred == -1, "Anômalo", "Normal")
+    df_work["score_normalidade"] = scores.astype("float32")
+    df_work["score_anomalia"]    = (-scores).astype("float32")
+
+    # Libera scores e pred antes do PCA
+    del pred, scores
+    gc.collect()
 
     pca_xy = pca_model.transform(X)
-    df_work["pca_1"] = pca_xy[:, 0]
-    df_work["pca_2"] = pca_xy[:, 1]
+    df_work["pca_1"] = pca_xy[:, 0].astype("float32")
+    df_work["pca_2"] = pca_xy[:, 1].astype("float32")
 
     sil = silhouette_score(X, df_work["anomalia"])
     dbi = davies_bouldin_score(X, df_work["anomalia"])
     var_exp = pca_model.explained_variance_ratio_
+
+    # Libera X — maior objeto em memória
+    del X, pca_xy
+    gc.collect()
+
+    # Descarta coluna score_normalidade (não usada no dashboard)
+    df_work = df_work.drop(columns=["score_normalidade"], errors="ignore")
 
     return df_work, sil, dbi, var_exp, feature_cols
 
@@ -170,6 +204,13 @@ if artefato is None:
     st.stop()
 
 df_result, silhouette, dbi, var_exp, feature_cols = detectar_anomalias(artefato, df_raw)
+
+# Guarda apenas o que a aba Visão Geral precisa de df_raw, depois libera
+_n_registros_originais = len(df_raw)
+_n_atributos_numericos = len([c for c in df_raw.select_dtypes(include="number").columns
+                               if not c.startswith("Unnamed")])
+del df_raw
+import gc; gc.collect()
 
 
 with st.sidebar:
@@ -309,12 +350,12 @@ with aba_visao:
     <div style="background:#1E2130;border:1px solid #2D3147;border-radius:12px;padding:16px;text-align:center;">
         <div style="font-size:2rem;color:#4C9BE8;font-weight:700;">{:,}</div>
         <div style="color:#A0AEC0;font-size:0.85rem;">Registros Originais</div>
-    </div>""".format(len(df_raw)), unsafe_allow_html=True)
+    </div>""".format(_n_registros_originais), unsafe_allow_html=True)
     col2.markdown("""
     <div style="background:#1E2130;border:1px solid #2D3147;border-radius:12px;padding:16px;text-align:center;">
         <div style="font-size:2rem;color:#68D391;font-weight:700;">{}</div>
         <div style="color:#A0AEC0;font-size:0.85rem;">Atributos Numéricos</div>
-    </div>""".format(len([c for c in df_raw.select_dtypes(include="number").columns if not c.startswith("Unnamed")])),
+    </div>""".format(_n_atributos_numericos),
     unsafe_allow_html=True)
     col3.markdown("""
     <div style="background:#1E2130;border:1px solid #2D3147;border-radius:12px;padding:16px;text-align:center;">
@@ -408,9 +449,10 @@ with aba_eda:
 
     
     st.markdown('<div class="section-header">Mapa de Correlação</div>', unsafe_allow_html=True)
-    num_cols_corr = [c for c in df_raw.select_dtypes(include="number").columns
-                     if c not in ("anomalia", "hour", "dayofweek", "month") and not c.startswith("Unnamed")]
-    corr = df_raw[num_cols_corr].corr()
+    num_cols_corr = [c for c in df_result.select_dtypes(include="number").columns
+                     if c not in ("anomalia", "hour", "dayofweek", "month", "pca_1", "pca_2",
+                                  "score_anomalia") and not c.startswith("Unnamed")]
+    corr = df_result[num_cols_corr].corr()
 
     fig_heat = px.imshow(
         corr,
