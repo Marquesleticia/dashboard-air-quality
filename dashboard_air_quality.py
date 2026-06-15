@@ -95,11 +95,18 @@ def carregar_dataset():
     df = None
     try:
         import io, zipfile, requests
-        resp = requests.get(url, timeout=30)
-        z = zipfile.ZipFile(io.BytesIO(resp.content))
+        resp = requests.get(url, timeout=30, stream=True)
+        buf = io.BytesIO()
+        for chunk in resp.iter_content(chunk_size=65536):
+            buf.write(chunk)
+        resp.close()
+        del resp
+        buf.seek(0)
+        z = zipfile.ZipFile(buf)
         fname = [n for n in z.namelist() if n.endswith(".xlsx")][0]
         df = pd.read_excel(z.open(fname))
-        resp = None  # libera bytes do ZIP da memória
+        z.close()
+        del buf
         gc.collect()
     except Exception:
         import os
@@ -180,7 +187,11 @@ def detectar_anomalias(_artefato, _df):
     df_work["pca_1"] = pca_xy[:, 0].astype("float32")
     df_work["pca_2"] = pca_xy[:, 1].astype("float32")
 
-    sil = silhouette_score(X, df_work["anomalia"])
+    # silhouette_score constrói matriz O(n²) — usa amostra para caber nos 512 MB do Render Free
+    _sample_size = min(2000, len(X))
+    rng = np.random.default_rng(42)
+    idx = rng.choice(len(X), size=_sample_size, replace=False)
+    sil = silhouette_score(X[idx], df_work["anomalia"].values[idx])
     dbi = davies_bouldin_score(X, df_work["anomalia"])
     var_exp = pca_model.explained_variance_ratio_
 
@@ -286,7 +297,7 @@ mask = (
     (df_result["hour"].between(hora_range[0], hora_range[1])) &
     (df_result["score_anomalia"] >= score_filtro)
 )
-df_filtrado = df_result[mask].copy()
+df_filtrado = df_result[mask]
 
 
 
@@ -604,7 +615,7 @@ with aba_modelo:
 
 with aba_anomalias:
 
-    df_anom = df_filtrado[df_filtrado["anomalia"] == 1].copy()
+    df_anom = df_filtrado[df_filtrado["anomalia"] == 1]
     qtd = len(df_anom)
     total_fil = len(df_filtrado)
     perc = qtd / total_fil * 100 if total_fil > 0 else 0
