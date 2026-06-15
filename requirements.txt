@@ -1,9 +1,9 @@
+numpy==2.2.3
+pandas==2.2.3
+scikit-learn==1.7.2
+scipy==1.15.3
 streamlit
-pandas
-numpy
 plotly
-scikit-learn
-scipy
 openpyxl
 requests
 joblib
